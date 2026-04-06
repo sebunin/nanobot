@@ -1,173 +1,270 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Бэкап навыков в GitHub с автоматическим обновлением README.md.
-Требует: gh CLI с настроенной авторизацией.
+Backup specified Nanobot workspace files to GitHub via gh CLI.
+Requires: gh CLI with configured auth (gh auth login).
+
+BACKUP_SOURCES defines what to copy and where in the repo.
+Structure in repo mirrors .nanobot layout.
 """
-import pathlib, subprocess, json, base64, re, datetime, sys
+import os
+import pathlib
+import subprocess
+import json
+import base64
+import re
+import datetime
+import sys
 
-REPO = 'sebunin/nanobot-skills'  # можно переопределить через env
-skills_dir = pathlib.Path.home() / '.nanobot' / 'workspace' / 'skills'
-PREFIX = 'workspace/skills'
-README_PATH = 'README.md'
-MARKER_START = '<!-- NANOBOT_SKILLS_START -->'
-MARKER_END = '<!-- NANOBOT_SKILLS_END -->'
+# ─── Configuration ────────────────────────────────────────────────────────────
 
-def run(cmd, input=None):
-    # input должен быть bytes если capture_output=True и text=False
-    if input is not None and isinstance(input, str):
-        input = input.encode('utf-8')
-    r = subprocess.run(cmd, capture_output=True, input=input)
-    # Декодируем вывод, игнорируя ошибки
-    stdout = r.stdout.decode('utf-8', errors='ignore') if r.stdout else ''
-    stderr = r.stderr.decode('utf-8', errors='ignore') if r.stderr else ''
-    return type('Result', (), {'returncode': r.returncode, 'stdout': stdout, 'stderr': stderr})
+NANOBOT = pathlib.Path.home() / ".nanobot"
+
+# Repository: owner/repo. Override via env var NANOBOT_GITHUB_REPO.
+# Agent: read GITHUB_SKILLS_REPO from MEMORY.md and pass as env or arg.
+REPO = os.environ.get("NANOBOT_GITHUB_REPO", "")
+if not REPO and len(sys.argv) > 1:
+    REPO = sys.argv[1]
+if not REPO:
+    print("ERROR: Repo not specified. Set NANOBOT_GITHUB_REPO or pass owner/repo as argument.")
+    sys.exit(1)
+
+# What to back up: list of (local_path, repo_path)
+# local_path: absolute path on disk
+# repo_path:  path inside the GitHub repository
+BACKUP_SOURCES = [
+    (NANOBOT / "workspace" / "skills",   "workspace/skills"),
+    (NANOBOT / "workspace" / "USER.md",  "workspace/USER.md"),
+    (NANOBOT / "workspace" / "projects", "workspace/projects"),
+    (NANOBOT / "cron",                   "cron"),
+]
+
+README_PATH  = "README.md"
+MARKER_START = "<!-- NANOBOT_SKILLS_START -->"
+MARKER_END   = "<!-- NANOBOT_SKILLS_END -->"
+
+# ─── gh CLI wrapper ───────────────────────────────────────────────────────────
+
+def run_gh(args, input_data=None):
+    """
+    Run a gh command. Returns (returncode, stdout, stderr) as strings.
+    Always uses UTF-8. Works on Windows with Cyrillic paths.
+    """
+    env = os.environ.copy()
+    env["PYTHONUTF8"] = "1"         # force UTF-8 in Python subprocess on Windows
+    env["GH_NO_UPDATE_NOTIFIER"] = "1"
+
+    inp = input_data.encode("utf-8") if isinstance(input_data, str) else input_data
+    r = subprocess.run(
+        ["gh"] + args,
+        capture_output=True,
+        input=inp,
+        env=env,
+    )
+    stdout = r.stdout.decode("utf-8", errors="replace") if r.stdout else ""
+    stderr = r.stderr.decode("utf-8", errors="replace") if r.stderr else ""
+    return r.returncode, stdout, stderr
+
+# ─── GitHub API helpers ───────────────────────────────────────────────────────
+
+def get_file_info(repo_path):
+    """
+    Fetch file info from GitHub.
+    Returns (sha, content_bytes) if file exists, (None, None) otherwise.
+    Single API call — avoids the double-request SHA race condition.
+    """
+    code, stdout, stderr = run_gh(["api", f"repos/{REPO}/contents/{repo_path}"])
+    if code != 0:
+        return None, None
+    try:
+        data = json.loads(stdout)
+        sha = data["sha"]
+        # GitHub inserts \n every 60 chars in base64 — strip before decoding
+        b64 = data.get("content", "").replace("\n", "")
+        content = base64.b64decode(b64) if b64 else b""
+        return sha, content
+    except Exception:
+        return None, None
+
+def upload_file(repo_path, local_bytes, sha=None, message=None):
+    """
+    Create or update a file in the repository.
+    sha must be provided when updating an existing file (else HTTP 422).
+    Returns True on success.
+    """
+    if message is None:
+        message = f"backup: update {repo_path}"
+    body = {
+        "message": message,
+        "content": base64.b64encode(local_bytes).decode("ascii"),
+    }
+    if sha:
+        body["sha"] = sha
+
+    code, stdout, stderr = run_gh(
+        ["api", f"repos/{REPO}/contents/{repo_path}",
+         "--method", "PUT", "--input", "-"],
+        input_data=json.dumps(body),
+    )
+    if code != 0:
+        print(f"  ERROR uploading {repo_path}: {stderr.strip()}")
+        return False
+    return True
+
+# ─── Secrets check ────────────────────────────────────────────────────────────
 
 def check_secrets():
-    """Запускает check_secrets.py и возвращает (ok, output)"""
-    script = pathlib.Path(__file__).parent / 'check_secrets.py'
+    """Run check_secrets.py. Returns True if safe to proceed."""
+    script = pathlib.Path(__file__).parent / "check_secrets.py"
     if not script.exists():
-        return True, 'check_secrets.py не найден'
-    r = run([sys.executable, str(script)])
-    output = (r.stdout or '') + (r.stderr or '')
-    return r.returncode == 0, output
+        print("WARNING: check_secrets.py not found, skipping secrets check.")
+        return True
+    env = os.environ.copy()
+    env["PYTHONUTF8"] = "1"
+    r = subprocess.run([sys.executable, str(script)], capture_output=True, env=env)
+    output = r.stdout.decode("utf-8", errors="replace")
+    print(output.strip())
+    if r.returncode != 0 or "СТОП!" in output:
+        return False
+    return True
 
-def gh_api(method, path, data=None, silent=False):
-    cmd = ['gh', 'api', path, '--method', method]
-    if silent:
-        cmd.append('--silent')
-    if data:
-        cmd += ['--input', '-']
-        r = run(cmd, input=json.dumps(data))
-    else:
-        r = run(cmd)
-    return r
+# ─── File upload logic ────────────────────────────────────────────────────────
 
-def get_file_sha(repo_path):
-    r = gh_api('GET', f'repos/{REPO}/contents/{repo_path}', silent=True)
-    if r.returncode == 0:
-        try:
-            return json.loads(r.stdout).get('sha')
-        except:
-            return None
-    return None
+def upload_source(local_path, repo_prefix):
+    """
+    Upload a single file or all files in a directory to the repo.
+    Skips files whose content hasn't changed.
+    Returns (changed_count, skipped_count).
+    """
+    changed = 0
+    skipped = 0
 
-def get_remote_content(repo_path):
-    r = gh_api('GET', f'repos/{REPO}/contents/{repo_path}', silent=True)
-    if r.returncode == 0 and r.stdout.strip():
-        try:
-            data = json.loads(r.stdout)
-            b64 = data.get('content', '').replace('\\n', '')
-            return base64.b64decode(b64) if b64 else None
-        except (json.JSONDecodeError, base64.binascii.Error):
-            return None
-    return None
+    if local_path.is_file():
+        # Single file (e.g. USER.md)
+        local_bytes = local_path.read_bytes()
+        sha, remote_bytes = get_file_info(repo_prefix)
+        if remote_bytes is not None and remote_bytes == local_bytes:
+            print(f"  unchanged: {repo_prefix}")
+            return 0, 1
+        ok = upload_file(repo_prefix, local_bytes, sha=sha)
+        if ok:
+            print(f"  uploaded:  {repo_prefix}")
+            return 1, 0
+        return 0, 0
 
-def upload_skills():
-    changed = []
-    skipped = []
-    for skill_dir in sorted(skills_dir.iterdir()):
-        if not skill_dir.is_dir():
-            continue
-        for f in skill_dir.rglob('*'):
+    if local_path.is_dir():
+        for f in sorted(local_path.rglob("*")):
             if not f.is_file():
                 continue
-            rel = f.relative_to(skills_dir)
-            repo_path = PREFIX + '/' + str(rel).replace('\\', '/')
+            rel = f.relative_to(local_path)
+            repo_path = repo_prefix + "/" + str(rel).replace("\\", "/")
             local_bytes = f.read_bytes()
-            remote_bytes = get_remote_content(repo_path)
+            sha, remote_bytes = get_file_info(repo_path)
             if remote_bytes is not None and remote_bytes == local_bytes:
-                skipped.append(repo_path)
+                skipped += 1
                 continue
-            sha = get_file_sha(repo_path)
-            body = {
-                'message': f'skills: update {rel}',
-                'content': base64.b64encode(local_bytes).decode(),
-            }
-            if sha:
-                body['sha'] = sha
-            r = gh_api('PUT', f'repos/{REPO}/contents/{repo_path}', body, silent=False)
-            if r.returncode == 0:
-                changed.append(repo_path)
-            else:
-                print(f'ОШИБКА загрузки {repo_path}: {r.stderr.strip()}')
-    print(f'Загрузка завершена. Обновлено: {len(changed)}, без изменений: {len(skipped)}')
-    return changed, skipped
+            ok = upload_file(repo_path, local_bytes, sha=sha)
+            if ok:
+                print(f"  uploaded:  {repo_path}")
+                changed += 1
+        return changed, skipped
+
+    print(f"  SKIP (not found): {local_path}")
+    return 0, 0
+
+# ─── README update ────────────────────────────────────────────────────────────
 
 def update_readme():
-    # Собираем таблицу навыков
+    """
+    Update only the skills table between MARKER_START and MARKER_END in README.md.
+    All other content is preserved.
+    """
+    skills_dir = NANOBOT / "workspace" / "skills"
+    if not skills_dir.exists():
+        print("  skills dir not found, skipping README update")
+        return
+
     def skill_info(d):
-        md = d / 'SKILL.md'
-        desc = '—'
+        md = d / "SKILL.md"
+        desc = "—"
         if md.exists():
-            txt = md.read_text(encoding='utf-8', errors='ignore')
-            m = re.search(r'^description:\\s*(.+)$', txt, re.M)
+            txt = md.read_text(encoding="utf-8", errors="ignore")
+            m = re.search(r"^description:\s*(.+)$", txt, re.M)
             if m:
-                desc = m.group(1).strip().split('.')[0]
+                desc = m.group(1).strip().split(".")[0]
         return d.name, desc
 
     skills = [skill_info(d) for d in sorted(skills_dir.iterdir()) if d.is_dir()]
-    now = datetime.datetime.now().strftime('%d.%m.%Y %H:%M')
-    rows = ['| Skill | Description |', '|-------|-------------|'] + [f'| `{n}` | {d} |' for n, d in skills]
-    table = f'<!-- Updated: {now} -->\n' + '\n'.join(rows)
-    block = f'{MARKER_START}\n{table}\n{MARKER_END}'
+    now = datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
+    rows = ["| Skill | Description |", "|-------|-------------|"]
+    rows += [f"| `{n}` | {d} |" for n, d in skills]
+    table = f"<!-- Updated: {now} -->\n" + "\n".join(rows)
+    block = f"{MARKER_START}\n{table}\n{MARKER_END}"
 
-    # Получаем текущий README
-    r = gh_api('GET', f'repos/{REPO}/contents/{README_PATH}', silent=True)
-    if r.returncode == 0 and r.stdout.strip():
-        try:
-            data = json.loads(r.stdout)
-            sha = data.get('sha')
-            b64 = data.get('content', '').replace('\\n', '')
-            content = base64.b64decode(b64).decode('utf-8', errors='ignore') if b64 else f'# Nanobot Skills\n\n{MARKER_START}\n{MARKER_END}\n'
-        except (json.JSONDecodeError, base64.binascii.Error):
-            sha = None
-            content = f'# Nanobot Skills\n\n{MARKER_START}\n{MARKER_END}\n'
+    # Fetch current README (single call: get SHA + content together)
+    sha, remote_bytes = get_file_info(README_PATH)
+    if remote_bytes is not None:
+        content = remote_bytes.decode("utf-8", errors="replace")
     else:
-        sha = None
-        content = f'# Nanobot Skills\n\n{MARKER_START}\n{MARKER_END}\n'
+        content = f"# Nanobot Skills\n\n{MARKER_START}\n{MARKER_END}\n\n## Install\nCopy skill folder to ~/.nanobot/workspace/skills/\n"
+        print("  README.md not found — will create from template")
 
-    # Заменяем блок
+    # Replace only the block between markers
     if MARKER_START in content and MARKER_END in content:
-        before = content[:content.index(MARKER_START)]
-        after = content[content.index(MARKER_END) + len(MARKER_END):]
+        before = content[: content.index(MARKER_START)]
+        after = content[content.index(MARKER_END) + len(MARKER_END) :]
         new_content = before + block + after
     else:
-        new_content = content.rstrip() + '\n\n' + block + '\n'
+        new_content = content.rstrip() + "\n\n" + block + "\n"
+        print("  Markers not found — table appended to end")
 
-    body = {
-        'message': f'docs: update skills table ({len(skills)} skills)',
-        'content': base64.b64encode(new_content.encode('utf-8')).decode(),
-    }
-    if sha:
-        body['sha'] = sha
+    if new_content == content:
+        print(f"  README.md unchanged ({len(skills)} skills)")
+        return
 
-    r = gh_api('PUT', f'repos/{REPO}/contents/{README_PATH}', body, silent=False)
-    if r.returncode == 0:
-        print(f'README.md обновлён: {len(skills)} навыков')
-        return True
-    else:
-        print('ОШИБКА обновления README:', r.stderr.strip())
-        return False
+    ok = upload_file(
+        README_PATH,
+        new_content.encode("utf-8"),
+        sha=sha,
+        message=f"docs: update skills table ({len(skills)} skills)",
+    )
+    if ok:
+        print(f"  README.md updated: {len(skills)} skills")
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    print('=== Бэкап навыков в GitHub ===')
-    # 1. Проверка секретов
-    ok, out = check_secrets()
-    print(out)
-    if not ok or 'СТОП!' in out:
-        print('Обнаружены потенциальные секреты. Прерываю.')
+    print(f"=== Nanobot GitHub Backup → {REPO} ===\n")
+
+    # 1. Check gh auth
+    code, stdout, stderr = run_gh(["auth", "status"])
+    if code != 0:
+        print("ERROR: gh not authorized. Run: gh auth login")
         sys.exit(1)
+    print("gh: authorized OK\n")
 
-    # 2. Загрузка файлов
-    print('Загрузка файлов...')
-    upload_skills()
+    # 2. Check secrets
+    print("Checking for secrets...")
+    if not check_secrets():
+        print("\nSTOP: secrets detected. Backup cancelled.")
+        sys.exit(1)
+    print()
 
-    # 3. Обновление README
-    print('Обновление README.md...')
-    if update_readme():
-        print('✅ Бэкап завершён успешно.')
-    else:
-        print('⚠️ Бэкап завершён с ошибками при обновлении README.')
+    # 3. Upload sources
+    total_changed = 0
+    total_skipped = 0
+    for local_path, repo_path in BACKUP_SOURCES:
+        print(f"Uploading: {local_path.name} → {repo_path}")
+        c, s = upload_source(local_path, repo_path)
+        total_changed += c
+        total_skipped += s
+    print(f"\nFiles: {total_changed} updated, {total_skipped} unchanged\n")
 
-if __name__ == '__main__':
+    # 4. Update README
+    print("Updating README.md...")
+    update_readme()
+
+    print("\n=== Backup complete ===")
+
+if __name__ == "__main__":
     main()
