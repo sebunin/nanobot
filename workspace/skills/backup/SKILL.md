@@ -33,14 +33,14 @@ metadata: {"nanobot":{"emoji":"💾","requires":{"bins":["python3","git"],"env":
 
 ## Что и куда архивировать
 
-| Тип      | Что включает                                         | Можно в GitHub |
-|----------|------------------------------------------------------|----------------|
-| `full`   | Всё: config, workspace, cron, sessions, history      | ❌ Нет         |
-| `public` | workspace (без sessions) + cron. Без config/history  | ✅ Да          |
-| `skills` | workspace/skills/                                    | ✅ Да          |
-| `memory` | workspace/memory/                                    | ✅ Да          |
-| `cron`   | cron/jobs.json                                       | ✅ Да          |
-| `config` | config.json (только локально!)                       | ❌ Нет         |
+| Тип      | Что включает                                               | Можно в GitHub |
+|----------|------------------------------------------------------------|----------------|
+| `full`   | Всё: config, workspace, cron, sessions, history            | ❌ Нет         |
+| `public` | workspace/skills + workspace/USER.md + workspace/projects + cron | ✅ Да    |
+| `skills` | workspace/skills/                                          | ✅ Да          |
+| `memory` | workspace/memory/                                          | ✅ Да          |
+| `cron`   | cron/                                                      | ✅ Да          |
+| `config` | config.json (только локально!)                             | ❌ Нет         |
 
 ---
 
@@ -176,223 +176,92 @@ for f in files:
 
 ---
 
-## Бэкап навыков в GitHub
+## Бэкап в GitHub
 
-Навык — это папка в `workspace/skills/`, содержащая `SKILL.md` и вспомогательные файлы.
+**Что копируется** (структура повторяет `.nanobot/workspace`):
+```
+workspace/skills/     → workspace/skills/
+workspace/USER.md     → workspace/USER.md
+workspace/projects/   → workspace/projects/
+cron/                 → cron/
+```
 
-**Инструмент:** GitHub CLI (`gh`). Клонирование репозитория не требуется — файлы загружаются напрямую через GitHub API.
+**Инструмент:** GitHub CLI (`gh`). Клонирование не требуется — файлы загружаются через API.  
+**Скрипт:** `workspace/skills/backup/backup_skills_to_github.py`
 
 ---
 
-### Шаг 1 — Проверить наличие и авторизацию gh
+### Шаг 1 — Проверить gh
 
 ```
 gh auth status
 ```
 
-Если команда вернула ошибку — **остановиться** и сообщить пользователю:
-
-> `gh` не найден или не авторизован. Установи GitHub CLI: https://cli.github.com  
-> Затем выполни: `gh auth login`
-
-Продолжать только если `gh auth status` завершился успешно.
+Если ошибка — **остановиться**:
+> Установи GitHub CLI: https://cli.github.com  
+> Затем: `gh auth login`
 
 ---
 
 ### Шаг 2 — Определить репозиторий
 
-Агент проверяет память (MEMORY.md) на наличие строки вида:
+Агент проверяет `MEMORY.md` на наличие:
 ```
 GITHUB_SKILLS_REPO: owner/repo-name
 ```
 
-Если запись есть — использовать её. Если нет — выполнить:
-
+Если нет — показать список:
 ```
-gh repo list --limit 20 --json name,nameWithOwner --jq ".[] | .nameWithOwner"
+gh repo list --limit 20 --json nameWithOwner --jq ".[].nameWithOwner"
 ```
 
-Показать список пользователю, попросить выбрать репозиторий для навыков.  
-После выбора — записать в MEMORY.md:
+Пользователь выбирает один раз. Агент сохраняет в `MEMORY.md`:
 ```
 GITHUB_SKILLS_REPO: owner/repo-name
 ```
 
 ---
 
-### Шаг 3 — Проверка секретов
+### Шаг 3 — Запустить скрипт
 
-Выполнить команду из раздела «Правила безопасности» выше.  
-Если вывод содержит `СТОП!` — остановиться. Дальнейшие шаги не выполнять.
+```
+python3 ~/.nanobot/workspace/skills/backup/backup_skills_to_github.py owner/repo-name
+```
+
+Или через переменную окружения:
+```
+NANOBOT_GITHUB_REPO=owner/repo-name python3 ~/.nanobot/workspace/skills/backup/backup_skills_to_github.py
+```
+
+Скрипт сам выполняет:
+1. Проверку авторизации `gh`
+2. Проверку секретов через `check_secrets.py`
+3. Загрузку изменившихся файлов (сравнение байт-в-байт, SHA берётся в том же запросе что и контент)
+4. Обновление таблицы навыков в `README.md` между маркерами
 
 ---
 
-### Шаг 4 — Загрузить файлы навыков в репозиторий
+### Структура README.md в репозитории
 
-Для каждого файла: читаем содержимое, получаем текущий SHA (если файл уже есть в репо), загружаем через `gh api`.  
-Загружаются только файлы, содержимое которых изменилось.
-
-```python
-python3 -c "
-import pathlib, subprocess, json, base64, sys
-
-REPO       = sys.argv[1]   # owner/repo-name
-skills_dir = pathlib.Path.home() / '.nanobot' / 'workspace' / 'skills'
-PREFIX     = 'workspace/skills'   # путь внутри репозитория
-changed    = []
-skipped    = []
-
-def gh_api(method, path, data=None):
-    cmd = ['gh', 'api', path, '--method', method, '--silent']
-    if data:
-        cmd += ['--input', '-']
-        r = subprocess.run(cmd, input=json.dumps(data),
-                           capture_output=True, text=True, encoding='utf-8')
-    else:
-        r = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8')
-    return r
-
-def get_file_sha(repo_path):
-    r = subprocess.run(
-        ['gh', 'api', f'repos/{REPO}/contents/{repo_path}'],
-        capture_output=True, text=True, encoding='utf-8'
-    )
-    if r.returncode == 0:
-        return json.loads(r.stdout).get('sha')
-    return None
-
-def get_remote_content(repo_path):
-    r = subprocess.run(
-        ['gh', 'api', f'repos/{REPO}/contents/{repo_path}'],
-        capture_output=True, text=True, encoding='utf-8'
-    )
-    if r.returncode == 0:
-        b64 = json.loads(r.stdout).get('content', '').replace('\\n', '')
-        try:
-            return base64.b64decode(b64)
-        except Exception:
-            return None
-    return None
-
-for skill_dir in sorted(skills_dir.iterdir()):
-    if not skill_dir.is_dir():
-        continue
-    for f in skill_dir.rglob('*'):
-        if not f.is_file():
-            continue
-        rel       = f.relative_to(skills_dir)
-        repo_path = PREFIX + '/' + str(rel).replace('\\\\', '/')
-        local_bytes = f.read_bytes()
-
-        # Сравниваем с версией в репо
-        remote_bytes = get_remote_content(repo_path)
-        if remote_bytes == local_bytes:
-            skipped.append(repo_path)
-            continue
-
-        sha  = get_file_sha(repo_path)
-        body = {
-            'message': f'skills: update {rel}',
-            'content': base64.b64encode(local_bytes).decode(),
-        }
-        if sha:
-            body['sha'] = sha
-
-        r = gh_api('PUT', f'repos/{REPO}/contents/{repo_path}', body)
-        if r.returncode == 0:
-            changed.append(repo_path)
-            print('Загружен:', repo_path)
-        else:
-            print('ОШИБКА:', repo_path, r.stderr)
-
-print(f'Готово. Обновлено: {len(changed)}, без изменений: {len(skipped)}')
-" OWNER/REPO
+README.md обновляется **только между маркерами** — всё остальное остаётся нетронутым:
+```
+<!-- NANOBOT_SKILLS_START -->
+...таблица навыков обновляется автоматически...
+<!-- NANOBOT_SKILLS_END -->
 ```
 
-Заменить `OWNER/REPO` на значение из шага 2.
+Если маркеров нет — таблица добавляется в конец файла.  
+Если README.md не существует — создаётся минимальный шаблон.
 
 ---
 
-### Шаг 5 — Обновить README.md в репозитории
+### Файлы навыка
 
-Обновляется **только блок между маркерами** `<!-- NANOBOT_SKILLS_START -->` и `<!-- NANOBOT_SKILLS_END -->`.  
-Остальное содержимое README.md остаётся нетронутым.
-
-```python
-python3 -c "
-import pathlib, subprocess, json, base64, re, datetime, sys
-
-REPO       = sys.argv[1]
-skills_dir = pathlib.Path.home() / '.nanobot' / 'workspace' / 'skills'
-REPO_PATH  = 'README.md'
-
-MARKER_START = '<!-- NANOBOT_SKILLS_START -->'
-MARKER_END   = '<!-- NANOBOT_SKILLS_END -->'
-TEMPLATE     = '# Nanobot Skills\n\n<!-- NANOBOT_SKILLS_START -->\n<!-- NANOBOT_SKILLS_END -->\n\n## Install\nCopy skill folder to ~/.nanobot/workspace/skills/\n'
-
-def skill_info(d):
-    md   = d / 'SKILL.md'
-    desc = '—'
-    if md.exists():
-        txt = md.read_text(encoding='utf-8', errors='ignore')
-        m   = re.search(r'^description:\\s*(.+)$', txt, re.M)
-        if m:
-            desc = m.group(1).strip().split('.')[0]
-    return d.name, desc
-
-skills = [skill_info(d) for d in sorted(skills_dir.iterdir()) if d.is_dir()]
-now    = datetime.datetime.now().strftime('%d.%m.%Y %H:%M')
-rows   = ['| Skill | Description |', '|-------|-------------|']       + [f'| `{n}` | {d} |' for n, d in skills]
-table  = f'<!-- Updated: {now} -->\n' + '\n'.join(rows)
-block  = f'{MARKER_START}\n{table}\n{MARKER_END}'
-
-# Получаем текущий README из репо
-r = subprocess.run(
-    ['gh', 'api', f'repos/{REPO}/contents/{REPO_PATH}'],
-    capture_output=True, text=True, encoding='utf-8'
-)
-
-if r.returncode == 0:
-    data = json.loads(r.stdout)
-    sha  = data['sha']
-    b64  = data['content'].replace('\\n', '')
-    content = base64.b64decode(b64).decode('utf-8', errors='ignore')
-else:
-    sha     = None
-    content = TEMPLATE
-    print('README.md не найден, будет создан из шаблона')
-
-if MARKER_START in content and MARKER_END in content:
-    before  = content[:content.index(MARKER_START)]
-    after   = content[content.index(MARKER_END) + len(MARKER_END):]
-    content = before + block + after
-else:
-    content = content.rstrip() + '\n\n' + block + '\n'
-    print('Маркеры не найдены — таблица добавлена в конец')
-
-body = {
-    'message': f'docs: update skills table ({len(skills)} skills)',
-    'content': base64.b64encode(content.encode('utf-8')).decode(),
-}
-if sha:
-    body['sha'] = sha
-
-result = subprocess.run(
-    ['gh', 'api', f'repos/{REPO}/contents/{REPO_PATH}',
-     '--method', 'PUT', '--silent', '--input', '-'],
-    input=json.dumps(body),
-    capture_output=True, text=True, encoding='utf-8'
-)
-
-if result.returncode == 0:
-    print(f'README.md обновлён: {len(skills)} навыков')
-else:
-    print('ОШИБКА обновления README:', result.stderr)
-    exit(1)
-" OWNER/REPO
-```
-
-Заменить `OWNER/REPO` на значение из шага 2.
+| Файл | Назначение |
+|------|-----------|
+| `SKILL.md` | Инструкции для агента |
+| `backup_skills_to_github.py` | Загрузка файлов в GitHub через gh API |
+| `check_secrets.py` | Проверка на секреты перед публикацией |
 
 ---
 
@@ -432,8 +301,9 @@ print('Восстановление завершено из:', archive)
 | Запрос пользователя             | Действие агента                                               |
 |---------------------------------|---------------------------------------------------------------|
 | «Полный бэкап»                  | Локальный архив `full`                                        |
-| «Бэкап навыков в GitHub»        | Шаги 1–6 из раздела «Бэкап навыков в GitHub»                 |
+| «Бэкап навыков в GitHub»        | Шаги 1–3 из раздела «Бэкап в GitHub»                         |
 | «Сохрани всё в GitHub»          | 🚨 Стоп: `config.json` содержит API-ключи, только локально   |
+| «Бэкап в GitHub»                | Шаги 1–3 из раздела «Бэкап в GitHub»                         |
 | «Бэкап конфига в GitHub»        | 🚨 Стоп: `config.json` нельзя публиковать                    |
 | «Бэкап крон» / «бэкап памяти»  | Уточнить: локально или GitHub?                                |
 | «Покажи резервные копии»        | Список файлов из `~/nanobot-backups/`                         |
