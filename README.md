@@ -4,31 +4,6 @@
 
 ## 📦 Содержимое
 
-- `clawdhub/` — поиск и установка скиллов из ClawHub
-- `gog/` — интеграция с Google Workspace (Gmail, Calendar, Drive)
-- `openmeteo/` — точный прогноз погоды через Open-Meteo API
-- `summarize/` — суммаризация текста/видео/подкастов
-- `weather/` — погода через wttr.in (fallback)
-
-## 🚀 Установка
-
-Скопируйте папку нужного скилла в:
-```
-~/.nanobot/workspace/skills/
-```
-
-## 📖 Документация
-
-Каждый скилл содержит файл `SKILL.md` с описанием и примерами использования.
-
-## 🔧 Требования
-
-- nanobot >= 0.1.0
-- Для некоторых скиллов требуются внешние утилиты (curl, gh и т.д.)
-
-## 📝 Лицензия
-
-MIT
 
 <!-- NANOBOT_SKILLS_START -->
 <!-- Updated: 07.04.2026 00:22 -->
@@ -52,3 +27,24 @@ MIT
 | `youtube-thumbnail-grabber` | Download YouTube video thumbnails in various resolutions |
 | `youtube-video-downloader` | Download YouTube videos in various formats and qualities |
 <!-- NANOBOT_SKILLS_END -->
+
+
+## 🚀 Установка
+
+Скопируйте папку нужного скилла в:
+```
+~/.nanobot/workspace/skills/
+```
+
+## 📖 Документация
+
+Каждый скилл содержит файл `SKILL.md` с описанием и примерами использования.
+
+## 🔧 Требования
+
+- nanobot >= 0.1.0
+- Для некоторых скиллов требуются внешние утилиты (curl, gh и т.д.)
+
+## 📝 Лицензия
+
+MIT
