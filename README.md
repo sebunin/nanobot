@@ -6,7 +6,7 @@
 
 
 <!-- NANOBOT_SKILLS_START -->
-<!-- Updated: 07.04.2026 01:46 -->
+<!-- Updated: 07.04.2026 16:01 -->
 | Skill | Description |
 |-------|-------------|
 | `backup` | Резервное копирование конфигурации, рабочего пространства, навыков, памяти и крон-заданий Nanobot |
@@ -22,6 +22,7 @@
 | `trello` | Управление досками, списками и карточками Trello через Trello REST API |
 | `twittertrends` | Search and analyze trending topics on X (Twitter) |
 | `weather` | Получение текущей погоды и прогнозов через wttr |
+| `web-search` | — |
 | `xtrends` | Search and analyze trending topics on X (Twitter) |
 | `youtube-summarize` | Summarize YouTube videos by extracting transcripts and captions |
 | `youtube-thumbnail-grabber` | Download YouTube video thumbnails in various resolutions |
